@@ -8,6 +8,8 @@ TT_co = TypeVar("TT_co", bound="type[Any]")
 
 
 class classproperty(Generic[TT_co, T_co]):
+    __slots__ = ("__func__",)
+
     def __init__(self, func: Callable[[TT_co], T_co]):
         self.__func__ = func
 

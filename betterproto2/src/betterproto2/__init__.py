@@ -69,41 +69,52 @@ TYPE_MESSAGE = "message"
 TYPE_MAP = "map"
 
 # Fields that use a fixed amount of space (4 or 8 bytes)
-FIXED_TYPES = [
-    TYPE_FLOAT,
-    TYPE_DOUBLE,
-    TYPE_FIXED32,
-    TYPE_SFIXED32,
-    TYPE_FIXED64,
-    TYPE_SFIXED64,
-]
+FIXED_TYPES = frozenset(
+    [
+        TYPE_FLOAT,
+        TYPE_DOUBLE,
+        TYPE_FIXED32,
+        TYPE_SFIXED32,
+        TYPE_FIXED64,
+        TYPE_SFIXED64,
+    ]
+)
 
 # Fields that are numerical 64-bit types
-INT_64_TYPES = [TYPE_INT64, TYPE_UINT64, TYPE_SINT64, TYPE_FIXED64, TYPE_SFIXED64]
+INT_64_TYPES = frozenset([TYPE_INT64, TYPE_UINT64, TYPE_SINT64, TYPE_FIXED64, TYPE_SFIXED64])
 
 # Fields that are numerical 32-bit types
-INT_32_TYPES = [TYPE_INT32, TYPE_UINT32, TYPE_SINT32, TYPE_FIXED32, TYPE_SFIXED32]
+INT_32_TYPES = frozenset([TYPE_INT32, TYPE_UINT32, TYPE_SINT32, TYPE_FIXED32, TYPE_SFIXED32])
 
 # Fields that are numerical types
-ALL_INT_TYPES = INT_64_TYPES + INT_32_TYPES
+ALL_INT_TYPES = INT_64_TYPES | INT_32_TYPES
 
 # Fields that are efficiently packed when
-PACKED_TYPES = [
-    TYPE_ENUM,
-    TYPE_BOOL,
-    TYPE_INT32,
-    TYPE_INT64,
-    TYPE_UINT32,
-    TYPE_UINT64,
-    TYPE_SINT32,
-    TYPE_SINT64,
-    TYPE_FLOAT,
-    TYPE_DOUBLE,
-    TYPE_FIXED32,
-    TYPE_SFIXED32,
-    TYPE_FIXED64,
-    TYPE_SFIXED64,
-]
+PACKED_TYPES = frozenset(
+    [
+        TYPE_ENUM,
+        TYPE_BOOL,
+        TYPE_INT32,
+        TYPE_INT64,
+        TYPE_UINT32,
+        TYPE_UINT64,
+        TYPE_SINT32,
+        TYPE_SINT64,
+        TYPE_FLOAT,
+        TYPE_DOUBLE,
+        TYPE_FIXED32,
+        TYPE_SFIXED32,
+        TYPE_FIXED64,
+        TYPE_SFIXED64,
+    ]
+)
+
+_FLOAT_TYPES = frozenset([TYPE_FLOAT, TYPE_DOUBLE])
+
+# Field kind tags for to_dict dispatch
+_FIELD_SCALAR = 0
+_FIELD_REPEATED = 1
+_FIELD_MAP = 2
 
 # Wire types
 # https://developers.google.com/protocol-buffers/docs/encoding#structure
@@ -477,6 +488,15 @@ class ProtoClassMetadata:
         "field_name_by_number",
         "meta_by_field_name",
         "sorted_field_names",
+        "type_hints",
+        "camel_cased_names",
+        "snake_cased_names",
+        "field_type_info",
+        "_to_dict_fields",
+        "is_pydantic_cls",
+        "field_defaults",
+        "_oneof_groups_to_validate",
+        "_schema_validator",
     )
 
     oneof_field_by_group: dict[str, set[dataclasses.Field]]
@@ -485,6 +505,14 @@ class ProtoClassMetadata:
     sorted_field_names: tuple[str, ...]
     default_gen: dict[str, Callable[[], Any]]
     cls_by_field: dict[str, type]
+    type_hints: dict[str, type]
+    camel_cased_names: dict[str, str]
+    snake_cased_names: dict[str, str]
+    # Pre-resolved field types: field_name -> (field_type, field_type_k, field_type_v)
+    # field_type: resolved type for non-map fields (with __args__[0] for repeated/optional)
+    # field_type_k, field_type_v: resolved key/value types for map fields
+    field_type_info: dict[str, tuple[type, type | None, type | None]]
+    _schema_validator: Any
 
     def __init__(self, cls: type[Message]):
         by_group: dict[str, set] = {}
@@ -513,6 +541,114 @@ class ProtoClassMetadata:
             self.default_gen[field.name] = field.default_factory
 
         self.cls_by_field = self._get_cls_by_field(cls, fields)
+
+        # Cache type hints
+        module = sys.modules[cls.__module__]
+        self.type_hints = get_type_hints(cls, module.__dict__, {})
+
+        # Cache cased field names (interned for fast dict key insertion)
+        self.camel_cased_names = {}
+        self.snake_cased_names = {}
+        for field_name in by_field_name:
+            self.camel_cased_names[field_name] = sys.intern(camel_case(field_name).rstrip("_"))
+            self.snake_cased_names[field_name] = sys.intern(snake_case(field_name).rstrip("_"))
+
+        # Pre-resolve field types for to_dict
+        self.field_type_info = {}
+        for field_name, meta in by_field_name.items():
+            ft = self.type_hints[field_name]
+            if meta.proto_type == TYPE_MAP:
+                self.field_type_info[field_name] = (ft, ft.__args__[0], ft.__args__[1])
+            elif meta.repeated or meta.optional:
+                self.field_type_info[field_name] = (ft.__args__[0], None, None)
+            else:
+                self.field_type_info[field_name] = (ft, None, None)
+
+        # Build flattened per-field to_dict dispatch table
+        # Each entry: (field_name, camel, snake, kind, conv, opt, key_conv)
+        to_dict_fields = []
+        for field_name, meta in by_field_name.items():
+            camel = self.camel_cased_names[field_name]
+            snake = self.snake_cased_names[field_name]
+            fti = self.field_type_info[field_name]
+            if meta.repeated:
+                conv = _make_value_converter(
+                    meta.proto_type,
+                    fti[0],
+                    meta.unwrap,
+                )
+                to_dict_fields.append(
+                    (
+                        field_name,
+                        camel,
+                        snake,
+                        _FIELD_REPEATED,
+                        conv,
+                        False,
+                        None,
+                    )
+                )
+            elif meta.proto_type == TYPE_MAP:
+                key_conv = _make_value_converter(
+                    meta.map_meta[0].proto_type,
+                    fti[1],
+                    None,
+                )
+                val_conv = _make_value_converter(
+                    meta.map_meta[1].proto_type,
+                    fti[2],
+                    meta.map_meta[1].unwrap,
+                )
+                to_dict_fields.append(
+                    (
+                        field_name,
+                        camel,
+                        snake,
+                        _FIELD_MAP,
+                        val_conv,
+                        False,
+                        key_conv,
+                    )
+                )
+            else:
+                conv = _make_converter(
+                    meta.proto_type,
+                    fti[0],
+                    meta.unwrap,
+                )
+                to_dict_fields.append(
+                    (
+                        field_name,
+                        camel,
+                        snake,
+                        _FIELD_SCALAR,
+                        conv,
+                        bool(meta.optional),
+                        None,
+                    )
+                )
+        self._to_dict_fields = tuple(to_dict_fields)
+
+        # Cache pydantic check
+        self.is_pydantic_cls = pydantic is not None and pydantic.dataclasses.is_pydantic_dataclass(cls)
+
+        # Pre-cache field defaults (avoids warnings.catch_warnings per call)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=DeprecationWarning)
+            self.field_defaults = {name: gen() for name, gen in self.default_gen.items()}
+
+        # Pre-compute oneof groups to validate (skip optional singletons)
+        groups_to_validate = []
+        for group, field_set in by_group.items():
+            if len(field_set) == 1:
+                (f,) = field_set
+                if by_field_name[f.name].optional:
+                    continue
+            groups_to_validate.append((group, tuple(f.name for f in field_set)))
+        self._oneof_groups_to_validate = tuple(groups_to_validate)
+
+        # Lazy-initialized pydantic SchemaValidator
+        self._schema_validator = None
 
     @staticmethod
     def _get_cls_by_field(cls: type[Message], fields: Iterable[dataclasses.Field]) -> dict[str, type]:  # type: ignore[reportSelfClsParameterName]
@@ -554,6 +690,153 @@ class OutputFormat(IntEnum):
     PROTO_JSON = 2
 
 
+# Local aliases for _value_to_dict to avoid repeated global lookups
+_OFP = OutputFormat.PYTHON
+_TM = TYPE_MESSAGE
+_TB = TYPE_BYTES
+_TE = TYPE_ENUM
+_I64 = INT_64_TYPES
+_FT = _FLOAT_TYPES
+_b64 = b64encode
+_df = _dump_float
+
+
+def _make_converter(proto_type, field_type, unwrapped_type):
+    """Build a per-field converter returning (converted, is_default)."""
+    if proto_type == _TM:
+        if unwrapped_type is not None:
+
+            def _conv(value, of, cas, idv):  # type: ignore[reportRedeclaration]
+                if of == _OFP:
+                    return value, False
+                return unwrapped_type().from_wrapped(value).to_dict(
+                    output_format=of,
+                    casing=cas,
+                    include_default_values=idv,
+                ), False
+        else:
+
+            def _conv(value, of, cas, idv):  # type: ignore[reportRedeclaration]
+                return value.to_dict(
+                    output_format=of,
+                    casing=cas,
+                    include_default_values=idv,
+                ), False
+
+        return _conv
+    if proto_type in _I64:
+
+        def _conv(value, of, cas, idv):  # type: ignore[reportRedeclaration]
+            is_def = not value
+            return (str(value), is_def) if of != _OFP else (value, is_def)
+
+        return _conv
+    if proto_type == _TB:
+
+        def _conv(value, of, cas, idv):  # type: ignore[reportRedeclaration]
+            is_def = not value
+            if of == _OFP:
+                return value, is_def
+            return _b64(value).decode("utf8"), is_def
+
+        return _conv
+    if proto_type == _TE:
+        _ft = field_type
+
+        def _conv(value, of, cas, idv):  # type: ignore[reportRedeclaration]
+            is_def = not value
+            if of == _OFP:
+                return value, is_def
+            ev = _ft(value)
+            if not ev.name:
+                return ev.value, is_def
+            return ev.proto_name or ev.name, is_def
+
+        return _conv
+    if proto_type in _FT:
+
+        def _conv(value, of, cas, idv):  # type: ignore[reportRedeclaration]
+            is_def = not value
+            if of == _OFP:
+                return value, is_def
+            return _df(value), is_def
+
+        return _conv
+
+    # Passthrough: bool, int32, uint32, sint32, string, fixed types
+    def _conv(value, of, cas, idv):
+        return value, not value
+
+    return _conv
+
+
+def _make_value_converter(proto_type, field_type, unwrapped_type):
+    """Build a per-field value-only converter returning converted."""
+    if proto_type == _TM:
+        if unwrapped_type is not None:
+
+            def _conv(value, of, cas, idv):  # type: ignore[reportRedeclaration]
+                if of == _OFP:
+                    return value
+                return (
+                    unwrapped_type()
+                    .from_wrapped(value)
+                    .to_dict(
+                        output_format=of,
+                        casing=cas,
+                        include_default_values=idv,
+                    )
+                )
+        else:
+
+            def _conv(value, of, cas, idv):  # type: ignore[reportRedeclaration]
+                return value.to_dict(
+                    output_format=of,
+                    casing=cas,
+                    include_default_values=idv,
+                )
+
+        return _conv
+    if proto_type in _I64:
+
+        def _conv(value, of, cas, idv):  # type: ignore[reportRedeclaration]
+            return str(value) if of != _OFP else value
+
+        return _conv
+    if proto_type == _TB:
+
+        def _conv(value, of, cas, idv):  # type: ignore[reportRedeclaration]
+            if of == _OFP:
+                return value
+            return _b64(value).decode("utf8")
+
+        return _conv
+    if proto_type == _TE:
+        _ft = field_type
+
+        def _conv(value, of, cas, idv):  # type: ignore[reportRedeclaration]
+            if of == _OFP:
+                return value
+            ev = _ft(value)
+            if not ev.name:
+                return ev.value
+            return ev.proto_name or ev.name
+
+        return _conv
+    if proto_type in _FT:
+
+        def _conv(value, of, cas, idv):  # type: ignore[reportRedeclaration]
+            return _df(value) if of != _OFP else value
+
+        return _conv
+
+    # Passthrough
+    def _conv(value, of, cas, idv):
+        return value
+
+    return _conv
+
+
 def _value_to_dict(
     value: Any,
     proto_type: str,
@@ -570,40 +853,39 @@ def _value_to_dict(
     Returns:
         A tuple (dict, is_default_value)
     """
-    kwargs = {  # For recursive calls
-        "output_format": output_format,
-        "casing": casing,
-        "include_default_values": include_default_values,
-    }
-
-    if proto_type == TYPE_MESSAGE:
-        if unwrapped_type is not None and output_format == OutputFormat.PYTHON:
+    if proto_type == _TM:
+        if unwrapped_type is not None and output_format == _OFP:
             return value, False
 
         if unwrapped_type is not None:
             value = unwrapped_type().from_wrapped(value)
 
-        return value.to_dict(**kwargs), False
+        return value.to_dict(
+            output_format=output_format,
+            casing=casing,
+            include_default_values=include_default_values,
+        ), False
 
-    if output_format == OutputFormat.PYTHON:
+    if output_format == _OFP:
         return value, not bool(value)
 
     # PROTO_JSON
-    if proto_type in INT_64_TYPES:
-        return str(value), not bool(value)
-    if proto_type == TYPE_BYTES:
-        return b64encode(value).decode("utf8"), not bool(value)
-    if proto_type == TYPE_ENUM:
+    is_default = not bool(value)
+    if proto_type in _I64:
+        return str(value), is_default
+    if proto_type == _TB:
+        return _b64(value).decode("utf8"), is_default
+    if proto_type == _TE:
         enum_value = field_type(value)
 
         # If we don't know the definition of this variant, we fall back to the value.
         if not enum_value.name:
-            return enum_value.value, not bool(value)
+            return enum_value.value, is_default
 
-        return enum_value.proto_name or enum_value.name, not bool(value)
-    if proto_type in (TYPE_FLOAT, TYPE_DOUBLE):
-        return _dump_float(value), not bool(value)
-    return value, not bool(value)
+        return enum_value.proto_name or enum_value.name, is_default
+    if proto_type in _FT:
+        return _df(value), is_default
+    return value, is_default
 
 
 def _value_from_dict(value: Any, meta: FieldMetadata, field_type: type, ignore_unknown_fields: bool) -> Any:
@@ -723,7 +1005,7 @@ class Message(ABC):
         """
         Check if the message is a pydantic dataclass.
         """
-        return pydantic is not None and pydantic.dataclasses.is_pydantic_dataclass(type(self))
+        return self._betterproto.is_pydantic_cls
 
     def _validate(self) -> None:
         """
@@ -732,12 +1014,18 @@ class Message(ABC):
         This is useful since pydantic does not revalidate the message when fields are changed. This function doesn't
         validate the fields recursively.
         """
-        if not self._is_pydantic():
+        bp = self._betterproto
+        if not bp.is_pydantic_cls:
             raise TypeError("Validation is only available for pydantic dataclasses.")
 
-        dict = self.__dict__.copy()
-        del dict["_unknown_fields"]
-        pydantic_core.SchemaValidator(self.__pydantic_core_schema__).validate_python(dict)  # type: ignore
+        validator = bp._schema_validator
+        if validator is None:
+            validator = pydantic_core.SchemaValidator(self.__pydantic_core_schema__)  # type: ignore
+            bp._schema_validator = validator
+
+        d = self.__dict__.copy()
+        del d["_unknown_fields"]
+        validator.validate_python(d)
 
     def dump(self, stream: SupportsWrite[bytes], delimit: bool = False) -> None:
         """
@@ -762,19 +1050,23 @@ class Message(ABC):
         """
         Get the binary encoded Protobuf representation of this message instance.
         """
-        if self._is_pydantic():
+        bp = self._betterproto
+        if bp.is_pydantic_cls:
             self._validate()
 
+        instance_dict = self.__dict__
+        field_defaults = bp.field_defaults
+
         with BytesIO() as stream:
-            for field_name, meta in self._betterproto.meta_by_field_name.items():
-                value = getattr(self, field_name)
+            for field_name, meta in bp.meta_by_field_name.items():
+                value = instance_dict[field_name]
 
                 if value is None:
                     # Optional items should be skipped. This is used for the Google
                     # wrapper types and proto3 field presence/optional fields.
                     continue
 
-                if value == self._get_field_default(field_name):
+                if value == field_defaults[field_name]:
                     # Default (zero) values are not serialized.
                     continue
 
@@ -857,10 +1149,7 @@ class Message(ABC):
         return field_cls
 
     def _get_field_default(self, field_name: str) -> Any:
-        with warnings.catch_warnings():
-            # ignore warnings when initialising deprecated field defaults
-            warnings.filterwarnings("ignore", category=DeprecationWarning)
-            return self._betterproto.default_gen[field_name]()
+        return self._betterproto.field_defaults[field_name]
 
     def _postprocess_single(self, wire_type: int, meta: FieldMetadata, field_name: str, value: Any) -> Any:
         """Adjusts values after parsing."""
@@ -1071,56 +1360,38 @@ class Message(ABC):
         Dict[:class:`str`, Any]
             The JSON serializable dict representation of this object.
         """
-        if self._is_pydantic():
+        bp = self._betterproto
+        if bp.is_pydantic_cls:
             self._validate()
 
-        kwargs = {  # For recursive calls
-            "output_format": output_format,
-            "casing": casing,
-            "include_default_values": include_default_values,
-        }
-
         output: dict[str, Any] = {}
-        field_types = self._type_hints()
+        is_camel = casing == Casing.CAMEL
+        instance_dict = self.__dict__
+        idv = include_default_values
+        of = output_format
+        cas = casing
 
-        for field_name, meta in self._betterproto.meta_by_field_name.items():
-            value = getattr(self, field_name)
-            cased_name = casing(field_name).rstrip("_")  # type: ignore
+        for field_name, camel, snake, kind, conv, opt, key_conv in bp._to_dict_fields:
+            value = instance_dict[field_name]
+            cased_name = camel if is_camel else snake
 
-            if meta.repeated or meta.optional:
-                field_type = field_types[field_name].__args__[0]
-            else:
-                field_type = field_types[field_name]
-
-            if meta.repeated:
-                output_value = [_value_to_dict(v, meta.proto_type, field_type, meta.unwrap, **kwargs)[0] for v in value]
-                if output_value or include_default_values:
-                    output[cased_name] = output_value
-
-            elif meta.proto_type == TYPE_MAP:
-                assert meta.map_meta is not None
-                field_type_k = field_types[field_name].__args__[0]
-                field_type_v = field_types[field_name].__args__[1]
-                output_map = {
-                    _value_to_dict(k, meta.map_meta[0].proto_type, field_type_k, None, **kwargs)[0]: _value_to_dict(
-                        v, meta.map_meta[1].proto_type, field_type_v, meta.map_meta[1].unwrap, **kwargs
-                    )[0]
-                    for k, v in value.items()
-                }
-
-                if output_map or include_default_values:
-                    output[cased_name] = output_map
-
-            else:
+            if kind == _FIELD_SCALAR:
                 if value is None:
-                    output_value, is_default = None, True
+                    ov, isd = None, True
                 else:
-                    output_value, is_default = _value_to_dict(value, meta.proto_type, field_type, meta.unwrap, **kwargs)
-                    if meta.optional:
-                        is_default = False
-
-                if include_default_values or not is_default:
-                    output[cased_name] = output_value
+                    ov, isd = conv(value, of, cas, idv)
+                    if opt:
+                        isd = False
+                if idv or not isd:
+                    output[cased_name] = ov
+            elif kind == _FIELD_REPEATED:
+                ov = [conv(v, of, cas, idv) for v in value]
+                if ov or idv:
+                    output[cased_name] = ov
+            else:
+                om = {key_conv(k, of, cas, idv): conv(v, of, cas, idv) for k, v in value.items()}
+                if om or idv:
+                    output[cased_name] = om
 
         return output
 
@@ -1275,25 +1546,17 @@ class Message(ABC):
 
     @classmethod
     def _validate_field_groups(cls, values):
-        group_to_one_ofs = cls._betterproto.oneof_field_by_group
-        field_name_to_meta = cls._betterproto.meta_by_field_name
-
-        for group, field_set in group_to_one_ofs.items():
-            if len(field_set) == 1:
-                (field,) = field_set
-                field_name = field.name
-                meta = field_name_to_meta[field_name]
-
-                # This is a synthetic oneof; we should ignore it's presence and not
-                # consider it as a oneof.
-                if meta.optional:
-                    continue
-
-            set_fields = [field.name for field in field_set if getattr(values, field.name, None) is not None]
-
-            if len(set_fields) > 1:
-                set_fields_str = ", ".join(set_fields)
-                raise ValueError(f"Group {group} has more than one value; fields {set_fields_str} are not None")
+        vdict = values.__dict__
+        for group, field_names in cls._betterproto._oneof_groups_to_validate:
+            count = 0
+            for fn in field_names:
+                if vdict.get(fn) is not None:
+                    count += 1
+                    if count > 1:
+                        set_fields = [n for n in field_names if vdict.get(n) is not None]
+                        raise ValueError(
+                            f"Group {group} has more than one value; fields {', '.join(set_fields)} are not None"
+                        )
 
         return values
 
